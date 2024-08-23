@@ -30,6 +30,7 @@ pub(crate) enum VaultState {
     Inactive,
     Triggered,
     Completed,
+    Drained,
 }
 
 /// Get the vault state from the transaction and the vault address
@@ -218,6 +219,7 @@ impl VaultCovenant {
             signature_building::GrindField::LockTime,
             &[vault_txout.clone(), fee_paying_output.clone()],
             leaf_hash,
+            0,
         )?;
 
         let mut txn = contract_components.transaction;
@@ -337,6 +339,7 @@ impl VaultCovenant {
             signature_building::GrindField::Sequence,
             &[vault_txout.clone(), fee_paying_output.clone()],
             leaf_hash,
+            0,
         )?;
 
         let mut txn = contract_components.transaction;
@@ -465,7 +468,7 @@ impl VaultCovenant {
             outputs: false,
             ..Default::default()
         };
-
+        
         let leaf_hash =
             TapLeafHash::from_script(&vault_cancel_withdrawal(), LeafVersion::TapScript);
         let vault_txout = TxOut {
@@ -477,6 +480,7 @@ impl VaultCovenant {
             signature_building::GrindField::LockTime,
             &[vault_txout.clone(), fee_paying_output.clone()],
             leaf_hash,
+            0,
         )?;
 
         let mut txn = contract_components.transaction;
@@ -534,6 +538,401 @@ impl VaultCovenant {
                 .serialize(),
         );
         txn.input.first_mut().unwrap().witness = vault_txin.witness.clone();
+
+        Ok(txn)
+    }
+
+    pub(crate) fn create_drain_trigger_tx(
+        &self,
+        fee_paying_utxo: &OutPoint,
+        fee_paying_output: TxOut,
+        target_address: &Address,
+    ) -> Result<Transaction> {
+        let mut vault_txin = TxIn {
+            previous_output: self
+                .current_outpoint
+                .ok_or(anyhow!("no current outpoint"))?,
+            ..Default::default()
+        };
+        let fee_txin = TxIn {
+            previous_output: *fee_paying_utxo,
+            ..Default::default()
+        };
+        let vault_output = TxOut {
+            script_pubkey: self.address()?.script_pubkey(),
+            value: self.amount,
+        };
+        let target_output = TxOut {
+            script_pubkey: target_address.script_pubkey(),
+            value: Amount::from_sat(546),
+        };
+
+        let txn = Transaction {
+            lock_time: LockTime::ZERO,
+            version: Version::TWO,
+            input: vec![fee_txin, vault_txin.clone()],
+            output: vec![fee_paying_output.clone(), target_output.clone()],
+        };
+
+        let tx_commitment_spec = TxCommitmentSpec {
+            prev_sciptpubkeys: false,
+            prev_amounts: false,
+            outputs: false,
+            ..Default::default()
+        };
+
+        let leaf_hash =
+            TapLeafHash::from_script(&vault_trigger_withdrawal(), LeafVersion::TapScript);
+        let vault_txout = TxOut {
+            script_pubkey: self.address()?.script_pubkey().clone(),
+            value: self.amount,
+        };
+        let contract_components = signature_building::grind_transaction(
+            txn,
+            signature_building::GrindField::LockTime,
+            &[fee_paying_output.clone(), vault_txout.clone()],
+            leaf_hash,
+            1,
+        )?;
+
+        let mut txn = contract_components.transaction;
+        let witness_components = get_sigmsg_components(
+            &tx_commitment_spec,
+            &txn,
+            1,
+            &[],
+            None,
+            leaf_hash,
+            TapSighashType::Default,
+        )?;
+
+        for component in witness_components.iter() {
+            debug!(
+                "pushing component <0x{}> into the witness",
+                component.to_hex_string(Case::Lower)
+            );
+            vault_txin.witness.push(component.as_slice());
+        }
+
+        let mut target_scriptpubkey_buffer = Vec::new();
+        target_output
+            .script_pubkey
+            .consensus_encode(&mut target_scriptpubkey_buffer)?;
+        vault_txin
+            .witness
+            .push(target_scriptpubkey_buffer.as_slice());
+
+        let mut fee_amount_buffer = Vec::new();
+        fee_paying_output
+            .value
+            .consensus_encode(&mut fee_amount_buffer)?;
+        vault_txin.witness.push(fee_amount_buffer.as_slice());
+        let mut fee_scriptpubkey_buffer = Vec::new();
+        fee_paying_output
+            .script_pubkey
+            .consensus_encode(&mut fee_scriptpubkey_buffer)?;
+        vault_txin.witness.push(fee_scriptpubkey_buffer.as_slice());
+
+        let mut amount_buffer = Vec::new();
+        self.amount.consensus_encode(&mut amount_buffer)?;
+        vault_txin.witness.push(amount_buffer.as_slice());
+        let mut scriptpubkey_buffer = Vec::new();
+        vault_output
+            .script_pubkey
+            .consensus_encode(&mut scriptpubkey_buffer)?;
+        vault_txin.witness.push(scriptpubkey_buffer.as_slice());
+
+        let computed_signature = signature_building::compute_signature_from_components(
+            &contract_components.signature_components,
+        )?;
+        let mangled_signature: [u8; 63] = computed_signature[0..63].try_into().unwrap(); // chop off the last byte, so we can provide the 0x00 and 0x01 bytes on the stack
+        vault_txin.witness.push(mangled_signature);
+
+        vault_txin
+            .witness
+            .push(vault_trigger_withdrawal().to_bytes());
+        vault_txin.witness.push(
+            self.taproot_spend_info()?
+                .control_block(&(vault_trigger_withdrawal().clone(), LeafVersion::TapScript))
+                .expect("control block should work")
+                .serialize(),
+        );
+        txn.input.get_mut(1).unwrap().witness = vault_txin.witness.clone();
+
+        Ok(txn)
+    }
+
+
+    pub(crate) fn create_drain_complete_tx(
+        // doesn't work
+        &self,
+        fee_paying_utxo: &OutPoint,
+        fee_paying_output: TxOut,
+        target_address: &Address,
+        trigger_tx: &Transaction,
+    ) -> Result<Transaction> {
+        let mut vault_txin = TxIn {
+            previous_output: self
+                .current_outpoint
+                .ok_or(anyhow!("no current outpoint"))?,
+            sequence: Sequence::from_height(self.timelock_in_blocks),
+            ..Default::default()
+        };
+        let fee_txin = TxIn {
+            previous_output: *fee_paying_utxo,
+            ..Default::default()
+        };
+
+        let target_output = TxOut {
+            script_pubkey: target_address.script_pubkey(),
+            // value: self.amount,
+            value: fee_paying_output.value,
+        };
+
+        let txn = Transaction {
+            lock_time: LockTime::ZERO,
+            version: Version::TWO,
+            input: vec![fee_txin, vault_txin.clone()],
+            output: vec![target_output.clone()],
+        };
+
+        let tx_commitment_spec = TxCommitmentSpec {
+            prevouts: false,
+            outputs: false,
+            ..Default::default()
+        };
+
+        let leaf_hash = TapLeafHash::from_script(
+            &vault_complete_withdrawal(self.timelock_in_blocks),
+            LeafVersion::TapScript,
+        );
+        let vault_txout = TxOut {
+            script_pubkey: self.address()?.script_pubkey().clone(),
+            value: self.amount,
+        };
+        let contract_components = signature_building::grind_transaction(
+            txn,
+            signature_building::GrindField::Sequence,
+            &[vault_txout.clone(), fee_paying_output.clone()],
+            leaf_hash,
+            1,
+        )?;
+
+        let mut txn = contract_components.transaction;
+        let witness_components = get_sigmsg_components(
+            &tx_commitment_spec,
+            &txn,
+            1,
+            // &[vault_txout.clone(), fee_paying_output.clone()],
+            &[fee_paying_output.clone(), vault_txout.clone()],
+            None,
+            leaf_hash,
+            TapSighashType::Default,
+        )?;
+
+        for component in witness_components.iter() {
+            debug!(
+                "pushing component <0x{}> into the witness",
+                component.to_hex_string(Case::Lower)
+            );
+            vault_txin.witness.push(component.as_slice());
+        }
+
+        debug!("Previous TXID: {}", trigger_tx.txid());
+
+        // stick all the previous txn components except the outputs into the witness
+        let mut version_buffer = Vec::new();
+        trigger_tx.version.consensus_encode(&mut version_buffer)?;
+        vault_txin.witness.push(version_buffer.as_slice());
+
+        // push the trigger_tx input in chunks no larger than 80 bytes
+        let mut input_buffer = Vec::new();
+        trigger_tx.input.consensus_encode(&mut input_buffer)?;
+        //vault_txin.witness.push(input_buffer.as_slice());
+        // TODO: handle the case where we have more than 2 chunks
+        // we have to break this up into 80 byte chunks because there's a policy limit on the size of a single push
+        let chunk_size = 80;
+        for chunk in input_buffer.chunks(chunk_size) {
+            vault_txin.witness.push(chunk);
+        }
+
+        let mut locktime_buffer = Vec::new();
+        trigger_tx
+            .lock_time
+            .consensus_encode(&mut locktime_buffer)?;
+        vault_txin.witness.push(locktime_buffer.as_slice());
+
+        // let mut vault_scriptpubkey_buffer = Vec::new();
+        // self.address()?
+        //     .script_pubkey()
+        //     .consensus_encode(&mut vault_scriptpubkey_buffer)?;
+        // vault_txin
+        //     .witness
+        //     .push(vault_scriptpubkey_buffer.as_slice());
+
+        // let mut amount_buffer = Vec::new();
+        // self.amount.consensus_encode(&mut amount_buffer)?;
+        // vault_txin.witness.push(amount_buffer.as_slice());
+
+        let mut fee_scriptpubkey_buffer = Vec::new();
+        fee_paying_output
+            .script_pubkey
+            .consensus_encode(&mut fee_scriptpubkey_buffer)?;
+        vault_txin.witness.push(fee_scriptpubkey_buffer.as_slice());
+        let mut fee_amount_buffer = Vec::new();
+        fee_paying_output
+            .value
+            .consensus_encode(&mut fee_amount_buffer)?;
+        vault_txin.witness.push(fee_amount_buffer.as_slice());
+
+        let mut target_scriptpubkey_buffer = Vec::new();
+        target_output
+            .script_pubkey
+            .consensus_encode(&mut target_scriptpubkey_buffer)?;
+        vault_txin
+            .witness
+            .push(target_scriptpubkey_buffer.as_slice());
+
+        // let mut fee_paying_prevout_buffer = Vec::new();
+        // fee_paying_utxo.consensus_encode(&mut fee_paying_prevout_buffer)?;
+        // vault_txin
+        //     .witness
+        //     .push(fee_paying_prevout_buffer.as_slice());
+
+        let mut vault_prevout_buffer = Vec::new();
+        self.get_current_outpoint()?.consensus_encode(&mut vault_prevout_buffer)?;
+        vault_txin
+            .witness
+            .push(vault_prevout_buffer.as_slice());
+
+        let computed_signature = signature_building::compute_signature_from_components(
+            &contract_components.signature_components,
+        )?;
+        let mangled_signature: [u8; 63] = computed_signature[0..63].try_into().unwrap(); // chop off the last byte, so we can provide the 0x00 and 0x01 bytes on the stack
+        vault_txin.witness.push(mangled_signature);
+
+        vault_txin
+            .witness
+            .push(vault_complete_withdrawal(self.timelock_in_blocks).to_bytes());
+        vault_txin.witness.push(
+            self.taproot_spend_info()?
+                .control_block(&(
+                    vault_complete_withdrawal(self.timelock_in_blocks).clone(),
+                    LeafVersion::TapScript,
+                ))
+                .expect("control block should work")
+                .serialize(),
+        );
+
+        // txn.input.first_mut().unwrap().witness = vault_txin.witness.clone();
+        txn.input.get_mut(1).unwrap().witness = vault_txin.witness.clone();
+
+        Ok(txn)
+    }
+
+    pub(crate) fn create_drain_cancel_tx(
+        &self,
+        fee_paying_utxo: &OutPoint,
+        fee_paying_output: TxOut,
+    ) -> Result<Transaction> {
+        let mut vault_txin = TxIn {
+            previous_output: self
+                .current_outpoint
+                .ok_or(anyhow!("no current outpoint"))?,
+            ..Default::default()
+        };
+        let fee_txin = TxIn {
+            previous_output: fee_paying_utxo.clone(),
+            ..Default::default()
+        };
+        let output = TxOut {
+            script_pubkey: self.address()?.script_pubkey(),
+            value: self.amount,
+        };
+
+        let txn = Transaction {
+            lock_time: LockTime::ZERO,
+            version: Version::TWO,
+            input: vec![fee_txin, vault_txin.clone()],
+            output: vec![fee_paying_output.clone()],
+        };
+
+        let tx_commitment_spec = TxCommitmentSpec {
+            prev_sciptpubkeys: false,
+            prev_amounts: false,
+            outputs: false,
+            ..Default::default()
+        };
+        
+        let leaf_hash =
+            TapLeafHash::from_script(&vault_cancel_withdrawal(), LeafVersion::TapScript);
+        let vault_txout = TxOut {
+            script_pubkey: self.address()?.script_pubkey().clone(),
+            value: self.amount,
+        };
+        let contract_components = signature_building::grind_transaction(
+            txn,
+            signature_building::GrindField::LockTime,
+            &[fee_paying_output.clone(), vault_txout.clone()],
+            leaf_hash,
+            1,
+        )?;
+
+        let mut txn = contract_components.transaction;
+        let witness_components = get_sigmsg_components(
+            &tx_commitment_spec,
+            &txn,
+            1,
+            &[],
+            None,
+            leaf_hash,
+            TapSighashType::Default,
+        )?;
+
+        for component in witness_components.iter() {
+            debug!(
+                "pushing component <0x{}> into the witness",
+                component.to_hex_string(Case::Lower)
+            );
+            vault_txin.witness.push(component.as_slice());
+        }
+        let computed_signature = signature_building::compute_signature_from_components(
+            &contract_components.signature_components,
+        )?;
+
+        let mut fee_amount_buffer = Vec::new();
+        fee_paying_output
+            .value
+            .consensus_encode(&mut fee_amount_buffer)?;
+        vault_txin.witness.push(fee_amount_buffer.as_slice());
+        let mut fee_scriptpubkey_buffer = Vec::new();
+        fee_paying_output
+            .script_pubkey
+            .consensus_encode(&mut fee_scriptpubkey_buffer)?;
+        vault_txin.witness.push(fee_scriptpubkey_buffer.as_slice());
+
+        let mut amount_buffer = Vec::new();
+        self.amount.consensus_encode(&mut amount_buffer)?;
+        vault_txin.witness.push(amount_buffer.as_slice());
+        let mut scriptpubkey_buffer = Vec::new();
+        output
+            .script_pubkey
+            .consensus_encode(&mut scriptpubkey_buffer)?;
+        vault_txin.witness.push(scriptpubkey_buffer.as_slice());
+
+        let mangled_signature: [u8; 63] = computed_signature[0..63].try_into().unwrap(); // chop off the last byte, so we can provide the 0x00 and 0x01 bytes on the stack
+        vault_txin.witness.push(mangled_signature);
+
+        vault_txin
+            .witness
+            .push(vault_cancel_withdrawal().to_bytes());
+        vault_txin.witness.push(
+            self.taproot_spend_info()?
+                .control_block(&(vault_cancel_withdrawal().clone(), LeafVersion::TapScript))
+                .expect("control block should work")
+                .serialize(),
+        );
+        txn.input.get_mut(1).unwrap().witness = vault_txin.witness.clone();
 
         Ok(txn)
     }

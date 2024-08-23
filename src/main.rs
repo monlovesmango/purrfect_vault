@@ -9,7 +9,7 @@ use clap::Parser;
 use log::{debug, error, info};
 
 use crate::settings::Settings;
-use crate::vault::contract::VaultState::{Completed, Inactive, Triggered};
+use crate::vault::contract::VaultState::{Completed, Inactive, Triggered, Drained};
 use crate::vault::contract::{VaultCovenant, VaultState};
 use crate::wallet::Wallet;
 
@@ -34,6 +34,9 @@ enum Action {
     Complete,
     Cancel,
     Status,
+    DrainWithTrigger { destination: String },
+    DrainWithComplete,
+    DrainWithCancel,
 }
 
 fn main() -> Result<()> {
@@ -64,6 +67,9 @@ fn main() -> Result<()> {
         Action::Complete => complete(&settings)?,
         Action::Cancel => cancel(&settings)?,
         Action::Status => status(&settings)?,
+        Action::DrainWithTrigger { destination } => drain_with_trigger(&destination, &settings)?,
+        Action::DrainWithComplete => drain_with_complete(&settings)?,
+        Action::DrainWithCancel => drain_with_cancel(&settings)?,
     }
     Ok(())
 }
@@ -234,3 +240,106 @@ fn deposit(settings: &Settings) -> Result<()> {
 
     Ok(())
 }
+
+fn drain_with_cancel(settings: &Settings) -> Result<()> {
+    info!("Draining the vault by cancelling the withdrawal");
+    let miner_wallet = Wallet::new("miner", settings);
+    let fee_wallet = Wallet::new("fee_payment", settings);
+    let mut vault = VaultCovenant::from_file(&settings.vault_file)?;
+
+    let fee_paying_address = fee_wallet.get_new_address()?;
+    let fee_paying_utxo = miner_wallet.send(&fee_paying_address, Amount::from_sat(10_000))?;
+    let cancel_tx = vault.create_drain_cancel_tx(
+        &fee_paying_utxo,
+        TxOut {
+            script_pubkey: fee_paying_address.script_pubkey(),
+            value: Amount::from_sat(10_000),
+        },
+    )?;
+
+    let signed_tx = fee_wallet.sign_tx(&cancel_tx)?;
+    let mut serialized_tx = Vec::new();
+    signed_tx.consensus_encode(&mut serialized_tx).unwrap();
+    debug!("serialized tx: {:?}", serialized_tx.raw_hex());
+    let txid = fee_wallet.broadcast_tx(&serialized_tx, Some(1000000000))?;
+    info!("sent txid: {}", txid);
+    miner_wallet.mine_blocks(Some(1))?;
+    vault.set_current_outpoint(OutPoint { txid, vout: 0 });
+    vault.set_state(Drained);
+    vault.to_file(&settings.vault_file)?;
+
+    Ok(())
+}
+
+fn drain_with_trigger(destination: &str, settings: &Settings) -> Result<()> {
+    info!("Draining the vault by triggering a withdrawal");
+    let miner_wallet = Wallet::new("miner", settings);
+    let fee_wallet = Wallet::new("fee_payment", settings);
+    let mut vault = VaultCovenant::from_file(&settings.vault_file)?;
+
+    let withdrawal_address = Address::from_str(destination)?.require_network(settings.network)?;
+
+    let fee_paying_address = fee_wallet.get_new_address()?;
+    let fee_paying_utxo = miner_wallet.send(&fee_paying_address, Amount::from_sat(10_000))?;
+    miner_wallet.mine_blocks(Some(1))?;
+    let trigger_tx = vault.create_drain_trigger_tx(
+        &fee_paying_utxo,
+        TxOut {
+            script_pubkey: fee_paying_address.script_pubkey(),
+            value: Amount::from_sat(10_000),
+        },
+        &withdrawal_address,
+    )?;
+    let signed_tx = fee_wallet.sign_tx(&trigger_tx)?;
+    let mut serialized_tx = Vec::new();
+    signed_tx.consensus_encode(&mut serialized_tx).unwrap();
+    debug!("serialized tx: {:?}", serialized_tx.raw_hex());
+    let txid = fee_wallet.broadcast_tx(&serialized_tx, Some(1000000000))?;
+    info!("sent trigger transaction txid: {}", txid);
+    miner_wallet.mine_blocks(Some(1))?;
+
+    vault.set_current_outpoint(OutPoint { txid, vout: 0 });
+    vault.set_withdrawal_address(Some(withdrawal_address));
+    vault.set_trigger_transaction(Some(trigger_tx));
+    vault.set_state(Drained);
+    vault.to_file(&settings.vault_file)?;
+
+    Ok(())
+}
+
+fn drain_with_complete(settings: &Settings) -> Result<()> {
+    info!("Draining the vault by completing the withdrawal");
+    let miner_wallet = Wallet::new("miner", settings);
+    let fee_wallet = Wallet::new("fee_payment", settings);
+    let mut vault = VaultCovenant::from_file(&settings.vault_file)?;
+    let timelock_in_blocks = vault.timelock_in_blocks;
+    let withdrawal_address = vault.get_withdrawal_address()?;
+    let trigger_tx = vault.get_trigger_transaction()?;
+
+    let fee_paying_address = fee_wallet.get_new_address()?;
+    let fee_paying_utxo = miner_wallet.send(&fee_paying_address, Amount::from_sat(10_000))?;
+    info!("need to mine {timelock_in_blocks} blocks for the timelock");
+    miner_wallet.mine_blocks(Some(timelock_in_blocks as u64))?;
+    let compete_tx = vault.create_drain_complete_tx(
+        &fee_paying_utxo,
+        TxOut {
+            script_pubkey: fee_paying_address.script_pubkey(),
+            value: Amount::from_sat(10_000),
+        },
+        &withdrawal_address,
+        &trigger_tx,
+    )?;
+    let signed_tx = fee_wallet.sign_tx(&compete_tx)?;
+    let mut serialized_tx = Vec::new();
+    signed_tx.consensus_encode(&mut serialized_tx).unwrap();
+    debug!("serialized tx: {:?}", serialized_tx.raw_hex());
+    let txid = fee_wallet.broadcast_tx(&serialized_tx, Some(1000000000))?;
+    info!("sent txid: {}", txid);
+    miner_wallet.mine_blocks(Some(1))?;
+    vault.set_current_outpoint(OutPoint { txid, vout: 0 });
+    vault.set_state(Drained);
+    vault.to_file(&settings.vault_file)?;
+
+    Ok(())
+}
+

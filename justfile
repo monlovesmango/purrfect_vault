@@ -20,6 +20,14 @@ cancel:
 complete:
     RUST_LOG=info ./target/release/purrfect_vault complete
 
+drain-with-trigger:
+    RUST_LOG=info ./target/release/purrfect_vault drain-with-trigger $({{ bcli }} -rpcwallet=miner getnewaddress)
+
+drain-with-cancel:
+    RUST_LOG=info ./target/release/purrfect_vault drain-with-cancel
+
+drain-with-complete:
+    RUST_LOG=info ./target/release/purrfect_vault drain-with-complete
 
 ###################################
 # Build and boostrapping commands #
@@ -47,4 +55,8 @@ bootstrap:
     just clean-bitcoin-data
     just start-bitcoind
 
+decode *ARGS:
+    {{ bcli }} decoderawtransaction {{ ARGS }}
 
+bcli *ARGS:
+    {{ bcli }} {{ ARGS }}

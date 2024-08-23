@@ -423,6 +423,7 @@ pub(crate) fn grind_transaction<S>(
     grind_field: GrindField,
     prevouts: &[TxOut],
     leaf_hash: S,
+    input_index: usize,
 ) -> anyhow::Result<ContractComponents>
 where
     S: Into<TapLeafHash> + Clone,
@@ -439,8 +440,13 @@ where
                 // make sure counter has the 31st bit set, so that it's not used as a relative timelock
                 // (BIP68 tells us that bit disables the consensus meaning of sequence numbers for RTL)
                 counter |= 1 << 31;
-                // set the sequence number of the last input to the counter, we'll use that to pay fees if there is more than one input
-                spend_tx.input.last_mut().unwrap().sequence = Sequence::from_consensus(counter);
+                if input_index > 0 {
+                    // set the sequence number of the last input to the counter, we'll use that to pay fees if there is more than one input
+                    spend_tx.input.first_mut().unwrap().sequence = Sequence::from_consensus(counter);
+                } else {
+                    // set the sequence number of the last input to the counter, we'll use that to pay fees if there is more than one input
+                    spend_tx.input.last_mut().unwrap().sequence = Sequence::from_consensus(counter);
+                }
             }
         }
         debug!("grinding counter {}", counter);
@@ -448,7 +454,7 @@ where
         let components_for_signature = get_sigmsg_components(
             &TxCommitmentSpec::default(),
             &spend_tx,
-            0,
+            input_index,
             prevouts,
             None,
             leaf_hash.clone(),
